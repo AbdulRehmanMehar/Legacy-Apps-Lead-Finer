@@ -11,6 +11,9 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
+# Skip Puppeteer Chromium download during build (Chromium installed in runner stage)
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+
 # Copy package files
 COPY package.json package-lock.json* ./
 
