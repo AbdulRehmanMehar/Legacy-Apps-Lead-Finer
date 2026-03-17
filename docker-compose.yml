@@ -1,0 +1,40 @@
+services:
+  legacyappleads:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: legacyappleads
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - TZ=Asia/Karachi
+      - MONGODB_URI=${MONGODB_URI}
+      - APIFY_API_TOKEN=${APIFY_API_TOKEN}
+      - GOOGLE_PAGESPEED_API_KEY=${GOOGLE_PAGESPEED_API_KEY}
+      - ROCKETREACH_API_KEY=${ROCKETREACH_API_KEY}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:7b}
+      - GMAIL_SMTP_IMAP_ACCOUNT=${GMAIL_SMTP_IMAP_ACCOUNT}
+      - GMAIL_SMTP_IMAP_APP_PASSWORD=${GMAIL_SMTP_IMAP_APP_PASSWORD}
+      - PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+      - PORT=3000
+    volumes:
+      - ./public/screenshots:/app/public/screenshots
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    labels:
+      - "com.docker.compose.project=autonomouscoldemails"
+      - "io.portainer.accesscontrol.teams=operations"
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge

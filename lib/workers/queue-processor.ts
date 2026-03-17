@@ -1,0 +1,546 @@
+import cron from 'node-cron';
+import dbConnect from '../mongodb';
+import { Company, AnalysisQueueItem } from '../models';
+import { analyzeCompany, formatAnalysisForStorage } from '../services/company-analyzer';
+import { discoverLeads, TECH_LIST } from '../services/discovery';
+import { searchPeopleAtCompany, lookupPerson } from '../services/rocketreach';
+import { generateInitialEmail, enrichCompanyProfile } from '../services/ollama';
+import { verifyEmail } from '../services/email-verifier';
+import { guessEmail } from '../services/email-guesser';
+import { EmailManager } from '../services/email-manager';
+import { OutreachAgent } from '../services/outreach-agent';
+import { canSendOutreachToContact, hasVerifiedOutreachContact } from '../utils';
+
+// ==========================================
+// CONSTANTS
+// ==========================================
+let techRotationIndex = 0;
+
+const MAX_STUCK_MINUTES = 15;   // For stages 1, 2
+const MAX_STUCK_DRAFTING = 5;   // Stage 4 — Ollama is fast, 5 min is enough
+const MAX_RETRIES = 3;          // Queue item retries before permanent failure
+const MAX_CONTACT_RETRIES = 5;  // Company-level contact-fetch retries before giving up
+
+// Exponential back-off delays per retry attempt (minutes)
+const BACKOFF_DELAYS_MINUTES = [0, 5, 30]; // attempt 1 = immediate, 2 = 5m, 3 = 30m
+
+// ==========================================
+// PER-STAGE CRON OVERLAP GUARDS
+// Prevents two cron instances from running the same stage simultaneously
+// ==========================================
+const stageRunning: Record<string, boolean> = {
+  stage1: false,
+  stage2: false,
+  stage3: false,
+  stage4: false,
+  stage5: false,
+};
+
+function withStageLock(stageName: string, fn: () => Promise<any>) {
+  return async () => {
+    if (stageRunning[stageName]) {
+      console.log(`⏭️  [${stageName.toUpperCase()}] Previous run still active — skipping this tick.`);
+      return;
+    }
+    stageRunning[stageName] = true;
+    try {
+      await fn();
+    } finally {
+      stageRunning[stageName] = false;
+    }
+  };
+}
+
+// ==========================================
+// DB CONNECT WITH RETRY
+// ==========================================
+async function connectWithRetry() {
+  try {
+    await dbConnect();
+  } catch (err) {
+    console.warn('[db] Initial dbConnect failed, retrying in 2s...');
+    await new Promise(r => setTimeout(r, 2000));
+    await dbConnect(); // Second attempt — let it throw if it fails again
+  }
+}
+
+// ==========================================
+// STAGE 1 — Discovery / Scraping
+// ==========================================
+export async function processStage1Scraping() {
+  console.log('⏳ [STAGE 1] Running Legacy Leads Discovery...');
+  try {
+    await connectWithRetry();
+
+    const targetTech = TECH_LIST[techRotationIndex % TECH_LIST.length];
+    techRotationIndex++;
+
+    console.log(`🤖 [STAGE 1] Seeding pipeline with up to 50 domains (Tranco List)`);
+    const { domains, sources } = await discoverLeads("any", 50);
+    console.log(`   📊 Sources: Tranco=${sources.tranco}`);
+
+    if (domains.length === 0) {
+      return { success: true, count: 0, tech: 'any', sources };
+    }
+
+    // Batch-check existing domains to avoid N+1 queries
+    const existingQueued = new Set(
+      (await AnalysisQueueItem.find({ domain: { $in: domains } }).select('domain')).map(
+        (d: any) => d.domain
+      )
+    );
+    const existingCompanies = new Set(
+      (await Company.find({ domain: { $in: domains } }).select('domain')).map(
+        (c: any) => c.domain
+      )
+    );
+
+    const newDomains = domains.filter(
+      d => !existingQueued.has(d) && !existingCompanies.has(d)
+    );
+
+    if (newDomains.length > 0) {
+      await AnalysisQueueItem.insertMany(
+        newDomains.map(domain => ({ company_id: 'auto-generated', domain, status: 'pending' })),
+        { ordered: false }
+      );
+    }
+
+    console.log(`✅ [STAGE 1] Queued ${newDomains.length} new domains.`);
+    return { success: true, count: newDomains.length, tech: targetTech, sources };
+  } catch (error) {
+    console.error('❌ [STAGE 1] Discovery Error:', error);
+    return { success: false, error: (error as Error).message };
+  }
+}
+
+// ==========================================
+// STAGE 2 — Tech Stack & Enrichment Analysis
+// ==========================================
+export async function processStage2Analysis() {
+  try {
+    await connectWithRetry();
+
+    const now = new Date();
+    const stuckCutoff = new Date(Date.now() - MAX_STUCK_MINUTES * 60 * 1000);
+
+    // Reset items stuck in 'processing' longer than MAX_STUCK_MINUTES
+    await AnalysisQueueItem.updateMany(
+      { status: 'processing', updated_at: { $lt: stuckCutoff }, retry_count: { $lt: MAX_RETRIES } },
+      { $set: { status: 'pending' }, $inc: { retry_count: 1 } }
+    );
+    await AnalysisQueueItem.updateMany(
+      { status: 'processing', updated_at: { $lt: stuckCutoff }, retry_count: { $gte: MAX_RETRIES } },
+      { $set: { status: 'failed', error: 'Max retries exceeded' } }
+    );
+
+    // Atomically claim the oldest pending item that's past its backoff delay
+    const item = await AnalysisQueueItem.findOneAndUpdate(
+      {
+        status: 'pending',
+        $or: [
+          { retry_delay_until: { $exists: false } },
+          { retry_delay_until: null },
+          { retry_delay_until: { $lte: now } },
+        ],
+      },
+      { $set: { status: 'processing' } },
+      { sort: { created_at: 1 }, returnDocument: 'after' }
+    );
+    if (!item) return { success: true, message: 'No pending items' };
+
+    console.log(`⏳ [STAGE 2] Analyzing domain tech stack: ${item.domain}`);
+
+    try {
+      const analysis = await analyzeCompany(item.domain, { skipPageSpeed: false, timeout: 60000 });
+      const storageData = formatAnalysisForStorage(analysis);
+
+      let company = await Company.findOne({ domain: item.domain });
+      let nextStatus = storageData.is_legacy ? 'needs_contacts' : 'rejected';
+
+      // Run AI Enrichment for legacy leads only (saves LLM tokens)
+      let enrichmentData = undefined;
+      if (storageData.is_legacy && storageData.pageText) {
+        console.log(`   🧠 [STAGE 2] Enriching company profile for ${item.domain}...`);
+        try {
+          const result = await enrichCompanyProfile(storageData.pageText);
+          if (result) enrichmentData = result;
+        } catch (enrichErr) {
+          console.error(`   ⚠️ [STAGE 2] Enrichment failed for ${item.domain}:`, enrichErr);
+        }
+      }
+
+      // Mark unreachable ONLY if everything failed and there was a network error
+      // If we have a PageSpeed score, the site was definitely reached.
+      if (storageData.tech_stack.length === 0 && !storageData.pagespeed_score && storageData.last_error) {
+        nextStatus = 'unreachable';
+      }
+      
+      // If marked unreachable, ensure PageSpeed score doesn't show up
+      if (nextStatus === 'unreachable') {
+        storageData.pagespeed_score = null;
+        storageData.pagespeed_data = null;
+      }
+      
+      const companyName = company?.name || item.domain;
+
+      if (company) {
+        company.tech_stack = storageData.tech_stack as any;
+        company.pagespeed_score = storageData.pagespeed_score ?? undefined;
+        company.pagespeed_data = storageData.pagespeed_data ?? undefined;
+        company.is_legacy = storageData.is_legacy;
+        company.legacy_reasons = storageData.legacy_reasons;
+        company.analyzed_at = storageData.analyzed_at as any;
+        if (enrichmentData) company.enrichment = enrichmentData;
+        if (storageData.screenshot_path) (company as any).screenshot_path = storageData.screenshot_path;
+        (company as any).last_error = storageData.last_error;
+        if (company.status === 'new' || company.status === 'analyzing') {
+          company.status = nextStatus;
+        }
+        await company.save();
+      } else {
+        company = await Company.create({
+          domain: item.domain,
+          name: companyName,
+          tech_stack: storageData.tech_stack,
+          pagespeed_score: storageData.pagespeed_score ?? undefined,
+          pagespeed_data: storageData.pagespeed_data ?? undefined,
+          is_legacy: storageData.is_legacy,
+          legacy_reasons: storageData.legacy_reasons,
+          enrichment: enrichmentData,
+          screenshot_path: storageData.screenshot_path,
+          analyzed_at: storageData.analyzed_at,
+          last_error: storageData.last_error,
+          status: nextStatus,
+        } as any);
+      }
+
+      item.status = 'completed';
+      item.completed_at = new Date();
+      await item.save();
+      console.log(`✅ [STAGE 2] Done. Legacy=${storageData.is_legacy} → ${nextStatus}`);
+      return { success: true, domain: item.domain, isLegacy: storageData.is_legacy, status: nextStatus };
+
+    } catch (analysisError) {
+      console.error(`❌ [STAGE 2] Failed to analyze ${item.domain}:`, analysisError);
+      const newRetryCount = (item.retry_count || 0) + 1;
+      item.retry_count = newRetryCount;
+
+      if (newRetryCount >= MAX_RETRIES) {
+        item.status = 'failed';
+      } else {
+        // Exponential back-off: wait 5 min on attempt 2, 30 min on attempt 3
+        const delayMinutes = BACKOFF_DELAYS_MINUTES[newRetryCount] ?? 60;
+        item.status = 'pending';
+        (item as any).retry_delay_until = new Date(Date.now() + delayMinutes * 60 * 1000);
+        console.log(`   ⏱️  Backing off ${delayMinutes}m before retry #${newRetryCount + 1}`);
+      }
+
+      item.error = analysisError instanceof Error ? analysisError.message : 'Unknown error';
+      await item.save();
+      return { success: false, domain: item.domain, error: (analysisError as Error).message };
+    }
+  } catch (error) {
+    console.error('❌ [STAGE 2] Queue Processor Error:', error);
+    return { success: false, error: (error as Error).message };
+  }
+}
+
+// ==========================================
+// STAGE 3 — Contact Fetching
+// ==========================================
+export async function processStage3Contacts() {
+  try {
+    await connectWithRetry();
+
+    const stuckCutoff = new Date(Date.now() - MAX_STUCK_MINUTES * 60 * 1000);
+
+    // Recover stuck fetching_contacts records
+    await Company.updateMany(
+      { status: 'fetching_contacts', updated_at: { $lt: stuckCutoff } },
+      { $set: { status: 'needs_contacts' } }
+    );
+
+    // Claim a batch of up to 10 companies
+    const companies = await Company.find({ status: 'needs_contacts' }).limit(10);
+    if (companies.length === 0) return { success: true, message: 'No companies needing contacts' };
+
+    console.log(`⏳ [STAGE 3] Processing batch of ${companies.length} companies for contacts...`);
+
+    const results = await Promise.all(companies.map(async (company) => {
+      // Optimistically lock the record
+      const locked = await Company.findOneAndUpdate(
+        { _id: company._id, status: 'needs_contacts' },
+        { $set: { status: 'fetching_contacts' } },
+        { returnDocument: 'after' }
+      );
+      if (!locked) return null;
+
+      try {
+        const rrKey = process.env.ROCKETREACH_API_KEY;
+        const searchName = locked.name || locked.domain;
+        const res = await searchPeopleAtCompany(searchName, locked.domain, { limit: 5 });
+
+        if (res.contacts && res.contacts.length > 0) {
+          locked.contacts = res.contacts.map((c: any) => ({
+            id: c.id,
+            firstName: c.firstName,
+            lastName: c.lastName,
+            fullName: c.fullName,
+            email: c.email,
+            linkedinUrl: c.linkedinUrl,
+            title: c.title,
+            seniority: c.seniority,
+            department: c.department,
+            drafts: [],
+            rocketreachId: c.rocketreachId,
+            emailProviderVerified: c.emailVerified || false,
+            deliveryStatus: 'unknown',
+            verificationStatus: 'unknown'
+          })) as any;
+
+          // Process all contacts in parallel — each contact's lookup + verify
+          // runs concurrently instead of sequentially.
+          await Promise.all(locked.contacts.map(async (contact: any) => {
+            let emailSource: 'existing' | 'rocketreach' | 'guess' | null =
+              contact.email ? 'existing' : null;
+
+            if (contact.email && contact.emailProviderVerified) {
+              contact.verificationStatus = 'verified';
+            }
+
+            // 1. AUTO-LOOKUP if email is missing
+            if (!emailSource && contact.rocketreachId) {
+              console.log(`   🔍 [STAGE 3] Lookup for ${contact.fullName} (${locked.domain})...`);
+              try {
+                const detailedPerson = await lookupPerson(contact.rocketreachId);
+                if (detailedPerson?.emails && detailedPerson.emails.length > 0) {
+                  const verifiedEmail = detailedPerson.emails.find((e: any) => e.is_valid)?.email || null;
+                  if (verifiedEmail) {
+                    contact.email = verifiedEmail;
+                    emailSource = 'rocketreach';
+                    contact.emailProviderVerified = true;
+                    contact.verificationStatus = 'verified';
+                    console.log(`   ✅ [STAGE 3] RocketReach verified email: ${verifiedEmail}`);
+                  }
+                }
+              } catch (lookupErr) {
+                console.error(`   ⚠️ [STAGE 3] Lookup failed for ${contact.fullName}:`, lookupErr);
+              }
+            }
+
+            // 2. PATTERN-BASED GUESS if still no email
+            if (!emailSource && contact.firstName && contact.lastName) {
+              try {
+                const guess = await guessEmail(contact.firstName, contact.lastName, locked.domain);
+                if (guess) {
+                  contact.email = guess.email;
+                  contact.verificationStatus = 'guessed';
+                  emailSource = 'guess';
+                  console.log(`   📧 [STAGE 3] Guessed: ${guess.email}`);
+                }
+              } catch (guessErr) {
+                console.error(`   ⚠️ [STAGE 3] Email guess failed for ${contact.fullName}:`, guessErr);
+              }
+            }
+
+            // 3. SMTP-verify only emails we actually found (not guesses — we already
+            //    know those are 'unknown' and SMTP-checking wastes 5s + risks IP blocks)
+            if (contact.email && emailSource !== 'guess' && !contact.emailProviderVerified) {
+              try {
+                const vResult = await verifyEmail(contact.email);
+                contact.verificationStatus = vResult.status === 'verified' ? 'unknown' : vResult.status;
+                console.log(`   🛡️ [STAGE 3] ${contact.email} → ${vResult.status}`);
+              } catch (vErr) {
+                console.error(`   ⚠️ [STAGE 3] Validation error for ${contact.email}:`, vErr);
+              }
+            }
+          }));
+
+          const hasVerifiedContacts = hasVerifiedOutreachContact(locked.contacts as any);
+          locked.status = hasVerifiedContacts ? 'needs_drafts' : 'needs_verified_contacts';
+          locked.last_error = hasVerifiedContacts
+            ? undefined
+            : 'Contacts found, but none have a verified email eligible for outreach.';
+          (locked as any).contact_retry_count = 0;
+          console.log(` ✅ [STAGE 3] ${locked.domain}: Found ${locked.contacts.length} profiles.`);
+        } else {
+          const retryCount = ((locked as any).contact_retry_count || 0) + 1;
+          (locked as any).contact_retry_count = retryCount;
+          if (retryCount >= MAX_CONTACT_RETRIES) {
+            locked.status = 'rejected';
+            console.log(` ⚠️ [STAGE 3] ${locked.domain}: No contacts after ${retryCount} attempts. Rejecting.`);
+          } else {
+            locked.status = 'needs_contacts';
+            console.log(` ⚠️ [STAGE 3] ${locked.domain}: No contacts found (attempt ${retryCount}/${MAX_CONTACT_RETRIES}).`);
+          }
+        }
+        await locked.save();
+        return { domain: locked.domain, count: res.contacts?.length || 0 };
+      } catch (err: any) {
+        locked.status = 'needs_contacts';
+        await locked.save();
+        console.error(` ❌ [STAGE 3] ${locked.domain}: Error:`, err.message);
+        return { domain: locked.domain, error: err.message };
+      }
+    }));
+
+    const validResults = results.filter(Boolean);
+    return { success: true, processed: validResults.length, details: validResults };
+  } catch (error) {
+    console.error('❌ [STAGE 3] Contact Fetching Error:', error);
+    return { success: false, error: (error as Error).message };
+  }
+}
+
+// ==========================================
+// STAGE 4 — Email Drafting
+// ==========================================
+export async function processStage4Drafts() {
+  try {
+    await connectWithRetry();
+
+    // Stage 4 uses a tighter stuck timeout — Ollama is fast, if it's stuck 5 min something crashed
+    const stuckCutoff = new Date(Date.now() - MAX_STUCK_DRAFTING * 60 * 1000);
+    await Company.updateMany(
+      { status: 'drafting', updated_at: { $lt: stuckCutoff } },
+      { $set: { status: 'needs_drafts' } }
+    );
+
+    // Process a batch of up to 5 companies per tick
+    const companies = [];
+    for (let i = 0; i < 5; i++) {
+      const company = await Company.findOneAndUpdate(
+        { status: 'needs_drafts' },
+        { $set: { status: 'drafting' } },
+        { returnDocument: 'after' }
+      );
+      if (!company) break;
+      companies.push(company);
+    }
+
+    if (companies.length === 0) return { success: true, message: 'No companies needing drafts' };
+
+    console.log(`⏳ [STAGE 4] Processing batch of ${companies.length} companies for drafts...`);
+    let totalDrafted = 0;
+
+    for (const company of companies) {
+      console.log(`   📝 [STAGE 4] Generating Emails for: ${company.domain}`);
+      let draftedCount = 0;
+      const mappedTechs = company.tech_stack.map((t: any) => t.name || String(t));
+
+      for (const contact of company.contacts) {
+        if (!canSendOutreachToContact(contact)) {
+          continue;
+        }
+
+        if (!contact.drafts || contact.drafts.length === 0) {
+          try {
+            const draft = await generateInitialEmail(
+              {
+                firstName: contact.firstName,
+                lastName: contact.lastName,
+                title: contact.title || 'Decision Maker',
+                company: company.name || company.domain,
+              },
+              {
+                domain: company.domain,
+                techStack: mappedTechs,
+                legacyReasons: company.legacy_reasons,
+                pagespeedScore: company.pagespeed_score,
+              }
+            );
+
+            contact.drafts.push({
+              subject: draft.subject,
+              body: draft.body,
+              type: 'initial',
+              created_at: new Date(),
+            } as any);
+
+            draftedCount++;
+            console.log(`   ✍️ Drafted email for ${contact.fullName}`);
+            await company.save(); // Persist each draft immediately for safety
+          } catch (e) {
+            console.error(`   ⚠️ Email generation failed for ${contact.fullName}`, e);
+          }
+        }
+      }
+
+      company.status = draftedCount > 0 ? 'drafts_ready' : 'rejected';
+      await company.save();
+      totalDrafted += draftedCount;
+      console.log(`   ✅ ${company.domain}: ${draftedCount} drafts generated.`);
+    }
+
+    console.log(`✅ [STAGE 4] Batch complete. ${totalDrafted} total email drafts across ${companies.length} companies.`);
+    return { success: true, companiesProcessed: companies.length, draftsGenerated: totalDrafted };
+
+  } catch (error) {
+    console.error('❌ [STAGE 4] Email Drafting Error:', error);
+    return { success: false, error: (error as Error).message };
+  }
+}
+
+// ==========================================
+// STAGE 5 — Automated Outreach
+// Sends ready drafts autonomously
+// ==========================================
+export async function processStage5Outreach() {
+  try {
+    await connectWithRetry();
+    console.log('⏳ [STAGE 5] Triggering OutreachAgent engagement tick...');
+    const result = await OutreachAgent.runEngagementTick();
+    console.log(`✅ [STAGE 5] Engagement tick done. Initial Sent=${result.initialSent}, Follow-ups=${result.followUpsSent}`);
+    return { success: true, ...result };
+  } catch (error) {
+    console.error('❌ [STAGE 5] Outreach Error:', error);
+    return { success: false, error: (error as Error).message };
+  }
+}
+
+// ==========================================
+// CRON DAEMON ENTRY
+// ==========================================
+export function startQueueProcessor() {
+  console.log('🚀 Starting fully autonomous AI Pipeline...');
+
+  const tasks = [
+    // Stage 1: daily seeding at midnight
+    cron.schedule('0 0 * * *', withStageLock('stage1', processStage1Scraping)),
+    // Stage 2: every minute
+    cron.schedule('* * * * *', withStageLock('stage2', processStage2Analysis)),
+    // Stage 3: every 1 minute
+    cron.schedule('* * * * *', withStageLock('stage3', processStage3Contacts)),
+    // Stage 4: every 3 minutes
+    cron.schedule('*/3 * * * *', withStageLock('stage4', processStage4Drafts)),
+    // Stage 5: every 5 minutes
+    cron.schedule('*/5 * * * *', withStageLock('stage5', processStage5Outreach)),
+    // Reply Sync: every 10 minutes
+    cron.schedule('*/10 * * * *', async () => {
+      console.log('🔄 [IMAP] Syncing replies...');
+      try {
+        const found = await EmailManager.syncReplies();
+        if (found > 0) console.log(`📩 [IMAP] Found ${found} new replies.`);
+      } catch (err) {
+        console.error('❌ [IMAP] Sync Error:', err);
+      }
+    }),
+  ];
+
+  const shutdown = () => {
+    console.log('\n🛑 Graceful shutdown: stopping cron tasks...');
+    tasks.forEach(t => t.stop());
+    process.exit(0);
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
+  console.log('✅ Background Pipeline Registered:');
+  console.log('   - Scraper       → Midnight daily');
+  console.log('   - Analyzer      → Every 1m');
+  console.log('   - Contacts      → Every 2m');
+  console.log('   - Email Drafter → Every 3m');
+  console.log('   - Outreach      → Every 5m');
+  console.log('   - Reply Sync    → Every 10m');
+}
