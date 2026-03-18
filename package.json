@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "NODE_ENV=production tsx --env-file=.env.local server.ts",
     "lint": "eslint .",
+    "test:emails": "tsx --env-file=.env.local scripts/test-email-db.ts",
     "test:pipeline": "tsx --env-file=.env.local scripts/test-pipeline.ts all",
     "test:health": "tsx --env-file=.env.local scripts/test-pipeline.ts health",
     "test:discovery": "tsx --env-file=.env.local scripts/test-pipeline.ts discovery",

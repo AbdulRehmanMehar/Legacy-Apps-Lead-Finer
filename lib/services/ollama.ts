@@ -25,6 +25,41 @@ export interface GeneratedEmail {
   body: string;
 }
 
+interface InitialEmailAngle {
+  type: 'speed' | 'mobile-ux' | 'maintenance' | 'content-velocity' | 'conversion-friction' | 'general';
+  observation: string;
+  consequence: string;
+  question: string;
+  asset: string;
+  cta: string;
+  structure: 'direct' | 'split' | 'lean';
+  followupOffer: string;
+  guidance: string[];
+}
+
+function toSubjectSlug(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/^www\./, '')
+    .replace(/\.[a-z]{2,}(\.[a-z]{2,})?$/, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function buildInitialSubject(company: string, domain: string): string {
+  const companySlug = toSubjectSlug(company);
+  const domainSlug = toSubjectSlug(domain);
+  const label = companySlug || domainSlug || 'your site';
+  const subjectOptions = [
+    `quick note on ${label}`,
+    `noticed this on ${label}`,
+    `${label} - quick observation`,
+    'quick note on your site',
+  ];
+
+  return subjectOptions[Math.floor(Math.random() * subjectOptions.length)];
+}
+
 const DEFAULT_CONFIG: OllamaConfig = {
   baseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
   model: process.env.OLLAMA_MODEL || 'qwen2.5:7b',
@@ -122,6 +157,332 @@ async function withRetry<T>(
   throw lastError;
 }
 
+function pickInitialEmailAngle(companyAnalysis: {
+  techStack: string[];
+  legacyReasons: string[];
+  pagespeedScore: number | null;
+}): InitialEmailAngle {
+  const pagespeedScore = companyAnalysis.pagespeedScore;
+  const reasons = companyAnalysis.legacyReasons.map((reason) => reason.toLowerCase());
+  const techStack = companyAnalysis.techStack.map((tech) => tech.toLowerCase());
+  const candidates: InitialEmailAngle[] = [];
+
+  const pickOne = <T,>(items: T[]): T => items[Math.floor(Math.random() * items.length)];
+  const hasCommerceStack = techStack.some((tech) =>
+    ['shopify', 'magento', 'woocommerce', 'bigcommerce', 'prestashop'].includes(tech)
+  );
+
+  if (reasons.some((reason) => reason.includes('drupal 7/8') || reason.includes('outdated wordpress') || reason.includes('end-of-life version'))) {
+    candidates.push({
+      type: 'maintenance',
+      observation: pickOne([
+        'my guess is simple page edits are taking more steps than they should once someone is in the cms.',
+        'it looks like publishing or updating homepage content probably takes more manual cleanup than it should.',
+      ]),
+      consequence: pickOne([
+        'that usually becomes a drag once campaigns or homepage updates need to move quickly.',
+        'that tends to slow teams down once a few people are touching landing pages or promos.',
+      ]),
+      question: pickOne([
+        'does that sound familiar on your side?',
+        'has that become a bottleneck yet?',
+      ]),
+      asset: pickOne([
+        'a short teardown of the pages that look hardest to update',
+        '3 notes on where update flow is probably getting slowed down',
+      ]),
+      cta: pickOne([
+        'want me to send that over?',
+        'worth me sending those notes?',
+      ]),
+      structure: pickOne(['direct', 'split', 'lean']),
+      followupOffer: 'a 5-point teardown of the pages that look hardest to maintain',
+      guidance: [
+        'do not open with the cms or framework name',
+        'anchor on maintenance drag, slower updates, or internal friction',
+      ],
+    });
+
+    candidates.push({
+      type: 'content-velocity',
+      observation: pickOne([
+        'it looks like simple content changes may be taking more steps than they should before a page can go live.',
+        'my guess is the team is probably doing more workaround-y stuff than it should for landing page updates.',
+      ]),
+      consequence: pickOne([
+        'that usually shows up when someone needs a page live fast and the site pushes back.',
+        'that tends to create drag right when a promo, banner, or landing page needs a quick change.',
+      ]),
+      question: pickOne([
+        'has that been an issue at all?',
+        'does that ever hold campaigns up?',
+      ]),
+      asset: pickOne([
+        'a short teardown focused on update bottlenecks',
+        'the first few pages i\'d check for content friction',
+      ]),
+      cta: pickOne([
+        'want me to send that over?',
+        'want the short version?',
+      ]),
+      structure: pickOne(['direct', 'split', 'lean']),
+      followupOffer: 'a short teardown focused on update bottlenecks and quick wins',
+      guidance: [
+        'talk about speed of updates, not migration',
+        'keep the value concrete and low-friction',
+      ],
+    });
+  }
+
+  if (pagespeedScore !== null && pagespeedScore < 35) {
+    candidates.push({
+      type: 'speed',
+      observation: pickOne([
+        'there\'s a slight delay before the homepage becomes interactive on mobile.',
+        hasCommerceStack
+          ? 'there\'s a slight delay before the homepage is usable on mobile, especially before someone can start browsing.'
+          : 'there\'s a slight delay before the homepage is usable on mobile, especially before someone can scroll or tap anything.',
+      ]),
+      consequence: pickOne([
+        'that\'s usually where we see people hesitate before they even get into the page.',
+        'that early pause is often where drop-off starts creeping in.',
+      ]),
+      question: pickOne([
+        `has that started showing up in drop-off yet?`,
+        `have you noticed that on the first visit?`,
+      ]),
+      asset: pickOne([
+        'the first 3 fixes i\'d check on the homepage',
+        'a quick teardown of the biggest first-load bottlenecks',
+      ]),
+      cta: pickOne([
+        'want me to send that over?',
+        'want the teardown?',
+      ]),
+      structure: pickOne(['split', 'lean']),
+      followupOffer: 'a quick teardown of the biggest speed bottlenecks i\'d check first',
+      guidance: [
+        `use the mobile performance score (${pagespeedScore}/100) as one possible proof point, not the entire email`,
+        'tie the issue to conversions, ux, or site speed',
+      ],
+    });
+
+    candidates.push({
+      type: 'mobile-ux',
+      observation: pickOne([
+        hasCommerceStack
+          ? 'on mobile there\'s a pause before products really show up on the homepage.'
+          : 'on mobile there\'s a pause before the page really settles and feels interactive.',
+        hasCommerceStack
+          ? 'the first load on mobile takes a beat before someone can scroll the homepage and start browsing.'
+          : 'the hero area takes a beat before someone can scroll or tap anything on mobile.',
+      ]),
+      consequence: pickOne([
+        hasCommerceStack
+          ? 'that\'s usually where we see people drop before they even start browsing.'
+          : 'that\'s usually enough for people to bounce before they get into the page.',
+        hasCommerceStack
+          ? 'that first pause is often where browse intent dies.'
+          : 'that first pause is often where drop-off starts creeping in.',
+      ]),
+      question: pickOne([
+        'have you seen that on mobile?',
+        'has that come up in drop-off at all?',
+      ]),
+      asset: pickOne([
+        'annotated mobile screenshots showing the first friction points',
+        '3 quick notes on the spots that feel sticky on mobile',
+      ]),
+      cta: pickOne([
+        'want me to send those over?',
+        'worth me sending the screenshots?',
+      ]),
+      structure: pickOne(['direct', 'split']),
+      followupOffer: 'annotated mobile notes showing the first friction points i\'d clean up',
+      guidance: [
+        'lead with the on-site experience, not a developer metric',
+        'keep the language human and commercial',
+      ],
+    });
+  }
+
+  if (pagespeedScore !== null && pagespeedScore < 50) {
+    candidates.push({
+      type: 'conversion-friction',
+      observation: pickOne([
+        'the first visit feels a little slower than it should before anything really becomes interactive.',
+        hasCommerceStack
+          ? 'there\'s a small delay before someone can properly get into browsing the homepage.'
+          : 'there\'s a short delay before the page feels settled enough to scroll or tap through.',
+      ]),
+      consequence: pickOne([
+        'that\'s usually where some of the easy conversion loss starts.',
+        'that kind of pause is often enough to create hesitation early.',
+      ]),
+      question: pickOne([
+        'have you noticed that at all?',
+        'has that shown up in drop-off?',
+      ]),
+      asset: pickOne([
+        'a short list of the first conversion bottlenecks i\'d check',
+        '3 notes on where the first-visit friction seems to be happening',
+      ]),
+      cta: pickOne([
+        'want me to send that over?',
+        'worth me sending the notes?',
+      ]),
+      structure: pickOne(['lean', 'direct']),
+      followupOffer: 'a short list of the first conversion-friction issues i\'d check',
+      guidance: [
+        'frame the issue around ux and conversion friction',
+        'do not let the score become the whole hook',
+      ],
+    });
+  }
+
+  if (reasons.some((reason) => reason.includes('largest contentful paint') || reason.includes('blocking time') || reason.includes('performance')) || techStack.includes('jquery')) {
+    candidates.push({
+      type: 'general',
+      observation: pickOne([
+        hasCommerceStack
+          ? 'the first load feels heavier than it should before someone can really browse the homepage.'
+          : 'the first impression feels a bit slower and clunkier than it should, especially before the first scroll.',
+        hasCommerceStack
+          ? 'there\'s a noticeable beat before the page feels ready to browse.'
+          : 'the page takes a beat before it feels properly settled enough to scroll or tap.',
+      ]),
+      consequence: pickOne([
+        'that\'s usually enough to lose people before they get into the page.',
+        'that tends to make the whole site feel older than it probably is right away.',
+      ]),
+      question: pickOne([
+        'have you noticed that at all?',
+        'has that come up internally?',
+      ]),
+      asset: pickOne([
+        'a 5-point teardown of the first-load bottlenecks',
+        'the first few areas i\'d check on the page',
+      ]),
+      cta: pickOne([
+        'want me to send that over?',
+        'worth me sending the teardown?',
+      ]),
+      structure: pickOne(['split', 'lean']),
+      followupOffer: 'the first bottlenecks i\'d check on the site',
+      guidance: [
+        'do not say jquery, react, or vue in the opener or problem paragraph',
+        'anchor on site speed, conversions, or ux instead of tech names',
+      ],
+    });
+  }
+
+  candidates.push({
+    type: 'general',
+    observation: pickOne([
+      'a couple parts of the site look like they\'re making the first visit harder than it needs to be, especially before someone can really interact.',
+      'it feels like the site is making people work a little too hard before they can scroll, tap, or get into the page properly.',
+    ]),
+    consequence: pickOne([
+      'that\'s usually where we see small conversion leaks start showing up.',
+      'that tends to chip away at momentum earlier than people expect.',
+    ]),
+    question: pickOne([
+      'has that shown up at all?',
+      'have you noticed that yet?',
+    ]),
+    asset: pickOne([
+      'a short teardown with the first 3 issues i\'d check',
+      'the first few notes i\'d send after a quick pass through the site',
+    ]),
+    cta: pickOne([
+      'want me to send that over?',
+      'worth me sending the notes?',
+    ]),
+    structure: pickOne(['direct', 'lean', 'split']),
+    followupOffer: 'a short teardown with the first quick wins i\'d look at',
+    guidance: [
+      'lead with business impact, not implementation details',
+      'keep the ask low-friction and centered on a teardown, notes, or quick wins',
+    ],
+  });
+
+  const nonScoreCandidates = candidates.filter((candidate) => candidate.type !== 'speed');
+  const pool = nonScoreCandidates.length > 0 ? nonScoreCandidates : candidates;
+  return pickOne(pool);
+}
+
+function buildInitialFallbackEmail(firstName: string, opener: string, angle: InitialEmailAngle): string {
+  const offerLine = `i can send ${angle.asset} if useful.`;
+
+  if (angle.structure === 'split') {
+    return `hey ${firstName.toLowerCase()}, ${opener}\n\n${angle.observation}\n\n${angle.consequence}\n\n${angle.question} ${offerLine}\nabdul`;
+  }
+
+  if (angle.structure === 'lean') {
+    return `hey ${firstName.toLowerCase()}, ${opener}\n\n${angle.observation} ${angle.consequence}\n\n${angle.question}\n\n${offerLine}\nabdul`;
+  }
+
+  return `hey ${firstName.toLowerCase()}, ${opener}\n\n${angle.observation} ${angle.consequence}\n\n${angle.question} ${offerLine}\nabdul`;
+}
+
+function shouldUseInitialFallback(body: string, angle: InitialEmailAngle): boolean {
+  const normalized = body.toLowerCase();
+
+  const forbiddenPhrases = [
+    'migration',
+    'migrate',
+    'rebuild',
+    'nextjs',
+    'react',
+    'vue',
+    'jquery',
+    'i read',
+    'you should',
+    'you need to',
+    'consider migrating',
+    'book a demo',
+    'schedule a call',
+    'hoping you\'re well',
+  ];
+
+  const leadsWithTech = /\n\n(?:noticed|saw|poked around|looks like).{0,120}\b(jquery|react|vue|angular|nextjs|wordpress|drupal|php|bootstrap|silverstripe)\b/i.test(normalized);
+  const missingLowFrictionAsk = !/(quick audit|quick wins|teardown|notes|first few fixes|bottlenecks)/i.test(normalized);
+  const mentionsTeachingLanguage = /(i read|you should|you need to|consider migrating)/i.test(normalized);
+  const hasForbiddenPhrase = forbiddenPhrases.some((phrase) => normalized.includes(phrase));
+  const tooPagespeedDriven = (normalized.match(/pagespeed|performance score/g) || []).length > 1;
+  const scoreUsedOutsideSpeedHook = angle.type !== 'speed' && /(pagespeed|performance score|\/100)/i.test(normalized);
+  const genericFrameworkPhrases = /(quick wins i\'d flag first|similar team|friction is visible|experience feel dated|affecting conversion rate|causing friction|obvious fixes hiding in plain sight)/i.test(normalized);
+  const badSignoffShape = !/\nabdul\s*$/i.test(body);
+  const extraCtaDrift = /(wanna take a look|want to take a look|want to share\?|open to a chat)/i.test(normalized);
+  const missingConcreteObservation = !/(homepage|hero|menu|content|products|scroll|tap|interactive|usable on mobile|first visit|first load|first interaction|landing page|cms)/i.test(normalized);
+
+  return leadsWithTech || missingLowFrictionAsk || mentionsTeachingLanguage || hasForbiddenPhrase || tooPagespeedDriven || scoreUsedOutsideSpeedHook || genericFrameworkPhrases || badSignoffShape || extraCtaDrift || missingConcreteObservation;
+}
+
+function buildFollowupFallback(previousBody: string, offer: string): string {
+  const normalized = previousBody.toLowerCase();
+
+  if (normalized.includes('mobile') || normalized.includes('browse')) {
+    return `i marked up 3 screenshots where the first mobile visit gets sticky. want me to send those over?\n\nabdul`;
+  }
+
+  if (normalized.includes('content') || normalized.includes('update')) {
+    return `i mapped the 3 pages that probably take the most effort to update. want me to send that over?\n\nabdul`;
+  }
+
+  return `i jotted down the first 3 places the page loses momentum. want me to send that over?\n\nabdul`;
+}
+
+function shouldUseFollowupFallback(body: string): boolean {
+  const normalized = body.toLowerCase();
+
+  return /(following up|circling back|checking in|touching base|brief site audit|consider a brief|quick audit\?|thoughts\?|just wanted to)/i.test(normalized)
+    || !/(teardown|notes|breakdown|bottlenecks|quick wins|screenshots|pages)/i.test(normalized)
+    || !/\n\s*abdul\s*$/i.test(body)
+    || /boost scores|help\?|significantly|improvements could|want to share\?|open to a chat/i.test(normalized)
+    || !/(send|sending|send over)/i.test(normalized);
+}
+
 /**
  * Generate search queries for finding multi-million dollar companies
  */
@@ -189,14 +550,20 @@ rules:
 - never use: modernize, enhance, streamline, leverage, optimize, delve, boost, cutting-edge, innovative, solution, outreach, transform, scalable
 - never use em dashes (—). use commas or periods.
 - never mention: scheduling calls, booking meetings, demos, or "hoping you're well"
-- one specific problem per email. don't list multiple issues. be slightly vague, not a know-it-all.
+- never lead with tech names like jquery, react, vue, nextjs, wordpress, drupal, php, or "framework"
+- lead with business impact first: conversions, speed, revenue, ux friction, slower updates, or customer experience
+- do not teach the recipient, do not say "i read," "you should," or anything that sounds preachy or uncertain
+- be specific about one real observation when possible. prefer what a human would notice on the page over quoting a tool score.
+- keep the first line curious, but do not make it weak or overly casual
+- sell a low-friction first step, not a migration. the ask should be screenshots, notes, a teardown, or first fixes
+- one specific problem per email. don't list multiple issues.
 - the email should feel like you're texting someone you met at a conference last month.
 
 structure (separated by blank lines):
 1. opener: one casual sentence. provided for you - use it exactly as given.
-2. poke the bear: 1-2 sentences. mention their site naturally. ask a genuine question about one specific problem you noticed. be curious, not preachy.
-3. proof: 1 sentence. casually mention a result you got for someone similar. keep it vague enough to be believable.
-4. cta + name: a short casual question (like "worth a look?" or "thoughts?") then your name on the next line.
+2. observation: 1-2 sentences. mention one specific issue naturally. make it concrete. ask a genuine question about the business impact.
+3. consequence: 1 sentence. say what that observation usually causes in plain english.
+4. question + soft offer: ask if they\'ve noticed it, then offer screenshots, notes, or a teardown in a natural way, then your name on the next line.
 
 examples of great emails:
 
@@ -205,11 +572,11 @@ subject: random thought
 body:
 hey sarah, this might sound random.
 
-noticed acme's site still runs on jquery. does that ever cause headaches when you're trying to push updates? feels like it'd slow the team down.
+your homepage takes a few seconds before it really settles on mobile.
 
-we helped a lifestyle brand in a similar spot cut their dev time in half after a rebuild.
+that\'s usually where people drop before they even get into the page.
 
-worth a look?
+curious if you\'ve noticed that? i can send the first 3 things i\'d check if useful.
 abdul
 
 example 2:
@@ -217,11 +584,11 @@ subject: quick q
 body:
 hey mike, had a random thought.
 
-was looking at brightstar's site and it took about 5 seconds to load on my phone. curious if that's been hurting conversions or if it hasn't really come up yet?
+there\'s a pause before products really show up on first load.
 
-helped a similar sized company get their load time under 2 seconds last quarter.
+that\'s usually where browse intent dies before someone even starts looking around.
 
-thoughts?
+have you noticed that at all? i can send annotated screenshots if useful.
 abdul
 
 example 3:
@@ -229,50 +596,29 @@ subject: quick thing
 body:
 hey lisa, honest question.
 
-poked around dataflow's site and noticed it's still running on silverstripe. ever worry about security gaps or is it just something the team maintains for now?
+my guess is simple page edits are taking more steps than they should.
 
-just moved a similar setup over to nextjs and their page speed jumped from 30 to 90.
+that usually becomes a drag when campaigns or content need to move quickly.
 
-worth exploring?
+curious if that sounds familiar? i can send a short teardown if useful.
 abdul`;
-
+  const selectedAngle = pickInitialEmailAngle(companyAnalysis);
   const legacyIssues = companyAnalysis.legacyReasons.length > 0
     ? companyAnalysis.legacyReasons.slice(0, 3).join(', ')
-    : 'potential performance improvements';
-
-  const techInfo = companyAnalysis.techStack.length > 0
-    ? `Current tech: ${companyAnalysis.techStack.slice(0, 5).join(', ')}`
-    : '';
-
-  const speedInfo = companyAnalysis.pagespeedScore !== null
-    ? `PageSpeed score: ${companyAnalysis.pagespeedScore}/100`
-    : '';
+    : 'performance and ux friction';
 
   const curiosityOpeners = [
-    "had a random thought.",
-    "quick one.",
-    "this might be out of left field.",
-    "weird timing but had a thought.",
-    "random one for you.",
     "been meaning to ask you something.",
-    "random one.",
-    "quick q.",
-    "something came to mind.",
-    "honest question.",
-    "this might sound random.",
+    "had one question for you.",
+    "something i noticed.",
+    "wanted to ask you about something.",
+    "curious about one thing.",
+    "meant to ask you this.",
   ];
   const opener = curiosityOpeners[Math.floor(Math.random() * curiosityOpeners.length)];
 
-  const subjectLines = [
-    "random thought",
-    "quick q",
-    "hey",
-    "quick thing",
-    "random idea",
-    "thought of you",
-    "quick one",
-  ];
-  const subject = subjectLines[Math.floor(Math.random() * subjectLines.length)];
+  const subject = buildInitialSubject(contact.company, companyAnalysis.domain);
+  const fallbackBody = buildInitialFallbackEmail(contact.firstName, opener, selectedAngle);
 
   const prompt = `Write a cold email for this lead. Follow the system prompt examples EXACTLY in tone and structure.
 
@@ -282,15 +628,28 @@ LEAD INFO:
 - company: ${contact.company}
 - website: ${companyAnalysis.domain}
 
-WHAT'S WRONG WITH THEIR SITE (pick ONE to write about):
-- ${legacyIssues}
-${techInfo ? `- ${techInfo}` : ''}
-${speedInfo ? `- ${speedInfo}` : ''}
+USE THIS EXACT ANGLE:
+- observation: ${selectedAngle.observation}
+- consequence: ${selectedAngle.consequence}
+- business-impact question: ${selectedAngle.question}
+- asset offer: ${selectedAngle.asset}
+- cta: ${selectedAngle.cta}
+
+BACKGROUND SIGNALS:
+- legacy issues: ${legacyIssues}
+${companyAnalysis.pagespeedScore !== null ? `- mobile performance score: ${companyAnalysis.pagespeedScore}/100` : ''}
+${selectedAngle.guidance.map((item) => `- ${item}`).join('\n')}
 
 ${customPrompt ? `Extra context: ${customPrompt}` : ''}
 
 The opener line MUST be exactly: "hey ${contact.firstName.toLowerCase()}, ${opener}"
 The subject line MUST be exactly: "${subject}"
+
+Do not mention migration, rebuilding, nextjs, react, vue, jquery, wordpress, drupal, php, or frameworks unless there is no other way to be specific.
+Do not teach them what the issue is. Ask about the effect on conversions, revenue, speed, ux, or internal update velocity.
+Avoid making every email about a performance score. Use the score only if it genuinely helps the hook.
+Keep the curiosity opener exactly as given. Do not change it.
+The final ask must be screenshots, notes, a teardown, or first fixes, not a project.
 
 Output format (nothing else):
 SUBJECT: ${subject}
@@ -319,7 +678,11 @@ BODY:
     .replace(/\[Write.*?\]/gi, '')
     .trim();
 
-  return { subject: parsedSubject, body: cleanBody.toLowerCase() };
+  const enforcedBody = shouldUseInitialFallback(cleanBody, selectedAngle)
+    ? fallbackBody
+    : cleanBody;
+
+  return { subject: parsedSubject, body: enforcedBody.toLowerCase() };
 }
 
 /**
@@ -349,6 +712,8 @@ RULES:
 - no exclamation marks. keep it chill.
 - all lowercase except proper nouns.
 - come at the problem from a DIFFERENT angle than the first email
+- bring one new piece of value, like annotated notes, a teardown, a breakdown, or the first bottlenecks you spotted
+- do not pivot into migration or tech-stack talk
 - end with a soft question
 - sign off with just your name on a new line
 
@@ -357,14 +722,14 @@ EXAMPLES OF GREAT FOLLOW-UPS:
 Example 1 (after an email about slow site speed):
 SUBJECT: re: quick q
 BODY:
-forgot to mention - we put together a free breakdown of what's slowing things down for sites like yours. want me to send it over?
+i made a note of the first two places the mobile experience feels sticky. want me to send that over?
 
 abdul
 
 Example 2 (after an email about outdated tech):
 SUBJECT: one more thing
 BODY:
-was thinking about this more. if the old setup isn't causing problems yet, it probably will when traffic picks up. happy to share what we've seen.
+i can send a short teardown of the pages that probably take the most effort to update. want it?
 
 thoughts?
 abdul`;
@@ -384,6 +749,7 @@ CONTEXT:
 ${customPrompt ? `Extra context: ${customPrompt}` : ''}
 
 Come at the problem from a different angle. Don't rehash the first email.
+Offer this new value naturally if it fits: ${previousEmail.body.toLowerCase().includes('mobile') ? 'annotated mobile notes' : 'a short teardown or the first bottlenecks spotted'}.
 
 Output format (nothing else):
 SUBJECT: [2-3 lowercase words, or "re: [original subject]"]
@@ -410,7 +776,15 @@ BODY:
     .replace(/^re:.*\n/i, '')
     .trim();
 
-  return { subject: subject.toLowerCase(), body: cleanBody.toLowerCase() };
+  const followupOffer = previousEmail.body.toLowerCase().includes('mobile')
+    ? 'annotated mobile notes'
+    : 'a short teardown of the first bottlenecks';
+
+  const enforcedBody = shouldUseFollowupFallback(cleanBody)
+    ? buildFollowupFallback(previousEmail.body, followupOffer)
+    : cleanBody;
+
+  return { subject: subject.toLowerCase(), body: enforcedBody.toLowerCase() };
 }
 
 /**
