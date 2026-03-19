@@ -20,6 +20,8 @@ const MAX_STUCK_MINUTES = 15;   // For stages 1, 2
 const MAX_STUCK_DRAFTING = 5;   // Stage 4 — Ollama is fast, 5 min is enough
 const MAX_RETRIES = 3;          // Queue item retries before permanent failure
 const MAX_CONTACT_RETRIES = 5;  // Company-level contact-fetch retries before giving up
+const STAGE1_SEED_BATCH_SIZE = 50;
+const STAGE1_LOW_WATERMARK = 10;
 
 // Exponential back-off delays per retry attempt (minutes)
 const BACKOFF_DELAYS_MINUTES = [0, 5, 30]; // attempt 1 = immediate, 2 = 5m, 3 = 30m
@@ -35,6 +37,8 @@ const stageRunning: Record<string, boolean> = {
   stage4: false,
   stage5: false,
 };
+
+let triggerStage1LowWatermarkRefill: null | (() => Promise<any>) = null;
 
 function withStageLock(stageName: string, fn: () => Promise<any>) {
   return async () => {
@@ -64,19 +68,29 @@ async function connectWithRetry() {
   }
 }
 
+async function countPendingQueueItems() {
+  return AnalysisQueueItem.countDocuments({ status: 'pending' });
+}
+
 // ==========================================
 // STAGE 1 — Discovery / Scraping
 // ==========================================
-export async function processStage1Scraping() {
-  console.log('⏳ [STAGE 1] Running Legacy Leads Discovery...');
+export async function processStage1Scraping(trigger: 'startup' | 'scheduled' | 'low-watermark' = 'scheduled') {
+  console.log(`⏳ [STAGE 1] Running Legacy Leads Discovery (${trigger})...`);
   try {
     await connectWithRetry();
+
+    const pendingCount = await countPendingQueueItems();
+    if (pendingCount >= STAGE1_LOW_WATERMARK) {
+      console.log(`ℹ️  [STAGE 1] Skipping seed. Pending queue already has ${pendingCount} item(s).`);
+      return { success: true, count: 0, skipped: true, pendingCount, trigger };
+    }
 
     const targetTech = TECH_LIST[techRotationIndex % TECH_LIST.length];
     techRotationIndex++;
 
-    console.log(`🤖 [STAGE 1] Seeding pipeline with up to 50 domains (Tranco List)`);
-    const { domains, sources } = await discoverLeads("any", 50);
+    console.log(`🤖 [STAGE 1] Seeding pipeline with up to ${STAGE1_SEED_BATCH_SIZE} domains (Tranco List)`);
+    const { domains, sources } = await discoverLeads("any", STAGE1_SEED_BATCH_SIZE);
     console.log(`   📊 Sources: Tranco=${sources.tranco}`);
 
     if (domains.length === 0) {
@@ -107,7 +121,7 @@ export async function processStage1Scraping() {
     }
 
     console.log(`✅ [STAGE 1] Queued ${newDomains.length} new domains.`);
-    return { success: true, count: newDomains.length, tech: targetTech, sources };
+    return { success: true, count: newDomains.length, tech: targetTech, sources, trigger };
   } catch (error) {
     console.error('❌ [STAGE 1] Discovery Error:', error);
     return { success: false, error: (error as Error).message };
@@ -147,7 +161,15 @@ export async function processStage2Analysis() {
       { $set: { status: 'processing' } },
       { sort: { created_at: 1 }, returnDocument: 'after' }
     );
-    if (!item) return { success: true, message: 'No pending items' };
+    if (!item) {
+      console.log('ℹ️  [STAGE 2] No pending queue items.');
+      if (triggerStage1LowWatermarkRefill) {
+        await triggerStage1LowWatermarkRefill();
+      } else {
+        await processStage1Scraping('low-watermark');
+      }
+      return { success: true, message: 'No pending items' };
+    }
 
     console.log(`⏳ [STAGE 2] Analyzing domain tech stack: ${item.domain}`);
 
@@ -263,7 +285,10 @@ export async function processStage3Contacts() {
 
     // Claim a batch of up to 10 companies
     const companies = await Company.find({ status: 'needs_contacts' }).limit(10);
-    if (companies.length === 0) return { success: true, message: 'No companies needing contacts' };
+    if (companies.length === 0) {
+      console.log('ℹ️  [STAGE 3] No companies currently need contacts.');
+      return { success: true, message: 'No companies needing contacts' };
+    }
 
     console.log(`⏳ [STAGE 3] Processing batch of ${companies.length} companies for contacts...`);
 
@@ -419,7 +444,10 @@ export async function processStage4Drafts() {
       companies.push(company);
     }
 
-    if (companies.length === 0) return { success: true, message: 'No companies needing drafts' };
+    if (companies.length === 0) {
+      console.log('ℹ️  [STAGE 4] No companies currently need drafts.');
+      return { success: true, message: 'No companies needing drafts' };
+    }
 
     console.log(`⏳ [STAGE 4] Processing batch of ${companies.length} companies for drafts...`);
     let totalDrafted = 0;
@@ -505,9 +533,13 @@ export async function processStage5Outreach() {
 export function startQueueProcessor() {
   console.log('🚀 Starting fully autonomous AI Pipeline...');
 
+  const runStage1Scheduled = withStageLock('stage1', () => processStage1Scraping('scheduled'));
+  const runStage1Startup = withStageLock('stage1', () => processStage1Scraping('startup'));
+  triggerStage1LowWatermarkRefill = withStageLock('stage1', () => processStage1Scraping('low-watermark'));
+
   const tasks = [
-    // Stage 1: daily seeding at midnight
-    cron.schedule('0 0 * * *', withStageLock('stage1', processStage1Scraping)),
+    // Stage 1: seed hourly, but only if the queue is below the low-water mark
+    cron.schedule('0 * * * *', runStage1Scheduled),
     // Stage 2: every minute
     cron.schedule('* * * * *', withStageLock('stage2', processStage2Analysis)),
     // Stage 3: every 1 minute
@@ -537,10 +569,12 @@ export function startQueueProcessor() {
   process.on('SIGINT', shutdown);
 
   console.log('✅ Background Pipeline Registered:');
-  console.log('   - Scraper       → Midnight daily');
+  console.log('   - Scraper       → On startup + hourly + low-watermark refill');
   console.log('   - Analyzer      → Every 1m');
-  console.log('   - Contacts      → Every 2m');
+  console.log('   - Contacts      → Every 1m');
   console.log('   - Email Drafter → Every 3m');
   console.log('   - Outreach      → Every 5m');
   console.log('   - Reply Sync    → Every 10m');
+
+  void runStage1Startup();
 }
