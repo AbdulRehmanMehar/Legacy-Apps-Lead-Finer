@@ -78,9 +78,11 @@ export class OutreachAgent {
 
     for (const company of companies) {
       for (const contact of company.contacts) {
-        // Skip if they replied or already have a follow-up sent
         if (contact.has_replied) continue;
-        if (!canSendOutreachToContact(contact)) continue;
+        if (!canSendOutreachToContact(contact)) {
+          console.log(`   ⏭️ [OutreachAgent] Skipping follow-up for ${contact.fullName} (${contact.email || 'no email'}) — status: ${contact.verificationStatus}, delivery: ${contact.deliveryStatus}`);
+          continue;
+        }
         
         const initialDraft = contact.drafts.find((d: any) => d.type === 'initial' && d.sent_at);
         if (!initialDraft) continue;

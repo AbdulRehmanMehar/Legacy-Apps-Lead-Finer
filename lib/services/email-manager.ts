@@ -1,6 +1,7 @@
 import nodemailer from 'nodemailer';
 import { ImapFlow } from 'imapflow';
 import { Company } from '../models';
+import { canSendOutreachToContact } from '../utils';
 import type { ContactDraft } from '../types';
 
 /**
@@ -34,7 +35,7 @@ export class EmailManager {
 
     try {
       const info = await this.transporter.sendMail({
-        from: `"${process.env.EMAIL_FROM_NAME || 'Outreach Assistant'}" <${process.env.GMAIL_SMTP_IMAP_ACCOUNT}>`,
+        from: `"${process.env.EMAIL_FROM_NAME || 'Abdul Rehman'}" <${process.env.GMAIL_SMTP_IMAP_ACCOUNT}>`,
         to,
         subject: draft.subject,
         text: draft.body,
@@ -73,7 +74,11 @@ export class EmailManager {
         pass: process.env.GMAIL_SMTP_IMAP_APP_PASSWORD || '',
       },
       logger: false,
-    });
+      // Without these, a stalled TCP connection hangs indefinitely and
+      // eventually throws AggregateError: ETIMEDOUT with no backoff applied.
+      socketTimeout: 20000,     // abort if socket is idle for 20s
+      connectionTimeout: 10000, // abort if the initial TLS handshake takes > 10s
+    } as any);
 
     let repliesFound = 0;
     let highestUidSeen = this.lastProcessedImapUid;
@@ -137,7 +142,7 @@ export class EmailManager {
                 bouncedContact.deliveryStatus = 'bounced';
                 bouncedContact.verificationStatus = 'invalid';
                 const hasSendableContact = bouncedCompany.contacts.some((c: any) =>
-                  c.email && c.verificationStatus === 'verified' && c.emailProviderVerified === true && c.deliveryStatus !== 'bounced'
+                  canSendOutreachToContact(c)
                 );
                 if (!hasSendableContact && ['needs_drafts', 'drafts_ready', 'contacted'].includes(bouncedCompany.status)) {
                   bouncedCompany.status = 'needs_verified_contacts';
@@ -200,12 +205,21 @@ export class EmailManager {
   }
 
   private static isImapRateLimitError(error: unknown): boolean {
-    const candidate = error as { code?: string; reason?: string; message?: string } | null;
+    const candidate = error as { code?: string; reason?: string; message?: string; errors?: unknown[] } | null;
     const haystack = `${candidate?.code || ''} ${candidate?.reason || ''} ${candidate?.message || ''}`.toLowerCase();
-    return haystack.includes('bandwidth limits')
-      || haystack.includes('command limits')
-      || haystack.includes('account exceeded')
-      || haystack.includes('noconnection');
+    // Flatten AggregateError sub-errors into the haystack so ETIMEDOUT is caught.
+    const subErrors = Array.isArray(candidate?.errors)
+      ? candidate.errors.map((e: any) => `${e?.code || ''} ${e?.message || ''}`).join(' ')
+      : '';
+    const full = `${haystack} ${subErrors}`.toLowerCase();
+    return full.includes('bandwidth limits')
+      || full.includes('command limits')
+      || full.includes('account exceeded')
+      || full.includes('noconnection')
+      || full.includes('etimedout')
+      || full.includes('econnrefused')
+      || full.includes('econnreset')
+      || full.includes('enotfound');
   }
 
   private static extractBouncedRecipient(fromEmail: string, subject: string, body: string): string | null {

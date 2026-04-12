@@ -3,13 +3,13 @@ import dbConnect from '../mongodb';
 import { Company, AnalysisQueueItem } from '../models';
 import { analyzeCompany, formatAnalysisForStorage } from '../services/company-analyzer';
 import { discoverLeads, TECH_LIST } from '../services/discovery';
+import { preflightFilter } from '../services/domain-preflight';
 import { searchPeopleAtCompany, lookupPerson } from '../services/rocketreach';
 import { generateInitialEmail, enrichCompanyProfile } from '../services/ollama';
 import { verifyEmail } from '../services/email-verifier';
-import { guessEmail } from '../services/email-guesser';
 import { EmailManager } from '../services/email-manager';
 import { OutreachAgent } from '../services/outreach-agent';
-import { canSendOutreachToContact, hasVerifiedOutreachContact } from '../utils';
+import { canSendOutreachToContact, hasVerifiedOutreachContact, isPersonalEmailDomain } from '../utils';
 
 // ==========================================
 // CONSTANTS
@@ -89,9 +89,13 @@ export async function processStage1Scraping(trigger: 'startup' | 'scheduled' | '
     const targetTech = TECH_LIST[techRotationIndex % TECH_LIST.length];
     techRotationIndex++;
 
-    console.log(`🤖 [STAGE 1] Seeding pipeline with up to ${STAGE1_SEED_BATCH_SIZE} domains (Tranco List)`);
+    const sourceLabel = process.env.APIFY_API_TOKEN ? 'Apify Google Search' : 'Tranco Fallback';
+    console.log(`🤖 [STAGE 1] Seeding pipeline with up to ${STAGE1_SEED_BATCH_SIZE} domains via ${sourceLabel}`);
     const { domains, sources } = await discoverLeads("any", STAGE1_SEED_BATCH_SIZE);
-    console.log(`   📊 Sources: Tranco=${sources.tranco}`);
+    const sourcesSummary = sources.apify != null
+      ? `Apify=${sources.apify} (bucket: ${sources.bucket})`
+      : `Tranco=${sources.tranco}`;
+    console.log(`   Sources: ${sourcesSummary}`);
 
     if (domains.length === 0) {
       return { success: true, count: 0, tech: 'any', sources };
@@ -109,9 +113,15 @@ export async function processStage1Scraping(trigger: 'startup' | 'scheduled' | '
       )
     );
 
-    const newDomains = domains.filter(
+    const dedupedDomains = domains.filter(
       d => !existingQueued.has(d) && !existingCompanies.has(d)
     );
+
+    // Pre-flight: drop dead sites, modern hosted platforms, and parked domains
+    // before they waste a Puppeteer slot in Stage 2.
+    const newDomains = dedupedDomains.length > 0
+      ? await preflightFilter(dedupedDomains)
+      : [];
 
     if (newDomains.length > 0) {
       await AnalysisQueueItem.insertMany(
@@ -120,7 +130,7 @@ export async function processStage1Scraping(trigger: 'startup' | 'scheduled' | '
       );
     }
 
-    console.log(`✅ [STAGE 1] Queued ${newDomains.length} new domains.`);
+    console.log(`✅ [STAGE 1] Queued ${newDomains.length} new domains (${dedupedDomains.length - newDomains.length} filtered by preflight).`);
     return { success: true, count: newDomains.length, tech: targetTech, sources, trigger };
   } catch (error) {
     console.error('❌ [STAGE 1] Discovery Error:', error);
@@ -307,7 +317,28 @@ export async function processStage3Contacts() {
         const res = await searchPeopleAtCompany(searchName, locked.domain, { limit: 5 });
 
         if (res.contacts && res.contacts.length > 0) {
-          locked.contacts = res.contacts.map((c: any) => ({
+          // Drop contacts with personal email domains before storing them.
+          // RocketReach occasionally returns gmail/yahoo/etc. addresses for business
+          // contacts — these are personal emails and will always bounce or be ignored.
+          const validRRContacts = res.contacts.filter((c: any) => {
+            if (c.email && isPersonalEmailDomain(c.email)) {
+              console.log(`   ⚠️ [STAGE 3] Skipping personal email for ${c.fullName}: ${c.email}`);
+              return false;
+            }
+            return true;
+          });
+
+          if (validRRContacts.length === 0) {
+            // All contacts had personal emails — treat as no contacts found
+            const retryCount = ((locked as any).contact_retry_count || 0) + 1;
+            (locked as any).contact_retry_count = retryCount;
+            locked.status = retryCount >= MAX_CONTACT_RETRIES ? 'rejected' : 'needs_contacts';
+            locked.last_error = 'All RocketReach contacts had personal email domains (gmail/yahoo/etc.)';
+            await locked.save();
+            return { domain: locked.domain, count: 0 };
+          }
+
+          locked.contacts = validRRContacts.map((c: any) => ({
             id: c.id,
             firstName: c.firstName,
             lastName: c.lastName,
@@ -324,60 +355,44 @@ export async function processStage3Contacts() {
             verificationStatus: 'unknown'
           })) as any;
 
-          // Process all contacts in parallel — each contact's lookup + verify
-          // runs concurrently instead of sequentially.
+          // Process all contacts in parallel.
           await Promise.all(locked.contacts.map(async (contact: any) => {
-            let emailSource: 'existing' | 'rocketreach' | 'guess' | null =
-              contact.email ? 'existing' : null;
-
+            // RocketReach already verified this email — trust it directly.
             if (contact.email && contact.emailProviderVerified) {
               contact.verificationStatus = 'verified';
+              console.log(`   ✅ [STAGE 3] ${contact.fullName}: RocketReach-verified email.`);
+              return;
             }
 
-            // 1. AUTO-LOOKUP if email is missing
-            if (!emailSource && contact.rocketreachId) {
+            // No email yet — attempt a RocketReach lookup by ID.
+            if (!contact.email && contact.rocketreachId) {
               console.log(`   🔍 [STAGE 3] Lookup for ${contact.fullName} (${locked.domain})...`);
               try {
                 const detailedPerson = await lookupPerson(contact.rocketreachId);
-                if (detailedPerson?.emails && detailedPerson.emails.length > 0) {
-                  const verifiedEmail = detailedPerson.emails.find((e: any) => e.is_valid)?.email || null;
-                  if (verifiedEmail) {
-                    contact.email = verifiedEmail;
-                    emailSource = 'rocketreach';
-                    contact.emailProviderVerified = true;
-                    contact.verificationStatus = 'verified';
-                    console.log(`   ✅ [STAGE 3] RocketReach verified email: ${verifiedEmail}`);
-                  }
+                const verifiedEmail = detailedPerson?.emails?.find((e: any) => e.is_valid)?.email
+                  ?? detailedPerson?.emails?.[0]?.email
+                  ?? null;
+                if (verifiedEmail) {
+                  contact.email = verifiedEmail;
+                  contact.emailProviderVerified = true;
+                  contact.verificationStatus = 'verified';
+                  console.log(`   ✅ [STAGE 3] RocketReach lookup found: ${verifiedEmail}`);
                 }
               } catch (lookupErr) {
                 console.error(`   ⚠️ [STAGE 3] Lookup failed for ${contact.fullName}:`, lookupErr);
               }
             }
 
-            // 2. PATTERN-BASED GUESS if still no email
-            if (!emailSource && contact.firstName && contact.lastName) {
-              try {
-                const guess = await guessEmail(contact.firstName, contact.lastName, locked.domain);
-                if (guess) {
-                  contact.email = guess.email;
-                  contact.verificationStatus = 'guessed';
-                  emailSource = 'guess';
-                  console.log(`   📧 [STAGE 3] Guessed: ${guess.email}`);
-                }
-              } catch (guessErr) {
-                console.error(`   ⚠️ [STAGE 3] Email guess failed for ${contact.fullName}:`, guessErr);
-              }
-            }
-
-            // 3. SMTP-verify only emails we actually found (not guesses — we already
-            //    know those are 'unknown' and SMTP-checking wastes 5s + risks IP blocks)
-            if (contact.email && emailSource !== 'guess' && !contact.emailProviderVerified) {
+            // Have an email but not provider-verified — run a lightweight MX check
+            // to confirm the domain can actually receive mail.
+            if (contact.email && !contact.emailProviderVerified) {
               try {
                 const vResult = await verifyEmail(contact.email);
-                contact.verificationStatus = vResult.status === 'verified' ? 'unknown' : vResult.status;
+                contact.verificationStatus = vResult.status;
                 console.log(`   🛡️ [STAGE 3] ${contact.email} → ${vResult.status}`);
               } catch (vErr) {
-                console.error(`   ⚠️ [STAGE 3] Validation error for ${contact.email}:`, vErr);
+                contact.verificationStatus = 'unknown';
+                console.error(`   ⚠️ [STAGE 3] MX check failed for ${contact.email}:`, vErr);
               }
             }
           }));
@@ -459,6 +474,7 @@ export async function processStage4Drafts() {
 
       for (const contact of company.contacts) {
         if (!canSendOutreachToContact(contact)) {
+          console.log(`   ⏭️ [STAGE 4] Skipping ${contact.fullName} (${contact.email || 'no email'}) — status: ${contact.verificationStatus}, delivery: ${contact.deliveryStatus}`);
           continue;
         }
 
